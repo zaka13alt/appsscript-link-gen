@@ -3,7 +3,7 @@
 import argparse
 import json
 import sys
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -27,11 +27,9 @@ def api_request(method, url, token, **kwargs):
 
     if not response.ok:
         try:
-            error = response.json()
-            message = json.dumps(error, indent=2)
+            message = json.dumps(response.json())
         except Exception:
             message = response.text
-
         raise RuntimeError(
             f"HTTP {response.status_code}: {message}"
         )
@@ -87,9 +85,7 @@ def create_version(token, script_id):
         "POST",
         f"{BASE_URL}/{script_id}/versions",
         token,
-        json={
-            "description": "Automated web app deployment",
-        },
+        json={"description": "Web app deployment"},
     )
 
 
@@ -101,7 +97,7 @@ def create_deployment(token, script_id, version_number):
         json={
             "versionNumber": version_number,
             "manifestFileName": "appsscript",
-            "description": "Automated web app deployment",
+            "description": "Web app deployment",
         },
     )
 
@@ -109,37 +105,64 @@ def create_deployment(token, script_id, version_number):
 def get_webapp_url(deployment):
     for entry_point in deployment.get("entryPoints", []):
         if entry_point.get("entryPointType") == "WEB_APP":
-            web_app = entry_point.get("webApp", {})
-            url = web_app.get("url")
-
+            url = entry_point.get("webApp", {}).get("url")
             if url:
                 return url
 
-    return None
+    raise RuntimeError("No web app URL returned")
+
+
+def generate_one(token, code, number):
+    project = create_project(
+        token,
+        f"Generated Web App {number}",
+    )
+
+    script_id = project["scriptId"]
+
+    upload_project(
+        token,
+        script_id,
+        code,
+    )
+
+    version = create_version(
+        token,
+        script_id,
+    )
+
+    deployment = create_deployment(
+        token,
+        script_id,
+        version["versionNumber"],
+    )
+
+    return get_webapp_url(deployment)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Create and deploy multiple Google Apps Script web apps."
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--codepath",
         required=True,
-        help="Path to code.gs",
     )
 
     parser.add_argument(
         "--links",
         required=True,
         type=int,
-        help="Number of web apps to create",
     )
 
     parser.add_argument(
         "--token",
         required=True,
-        help="Google OAuth2 access token",
+    )
+
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
     )
 
     args = parser.parse_args()
@@ -147,114 +170,36 @@ def main():
     if args.links < 1:
         parser.error("--links must be at least 1")
 
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+
     code_path = Path(args.codepath)
 
     if not code_path.is_file():
-        print(
-            f"ERROR: code file does not exist: {code_path}",
-            file=sys.stderr,
-        )
         sys.exit(1)
 
-    try:
-        code = code_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        print(
-            f"ERROR: could not read {code_path}: {exc}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    code = code_path.read_text(encoding="utf-8")
 
-    results = []
+    with ThreadPoolExecutor(
+        max_workers=args.workers
+    ) as executor:
 
-    print(f"Creating {args.links} Google Apps Script web apps...")
-    print()
-
-    for i in range(1, args.links + 1):
-        title = f"Generated Web App {i}"
-
-        try:
-            print(f"[{i}/{args.links}] Creating project...")
-
-            project = create_project(args.token, title)
-            script_id = project["scriptId"]
-
-            print(f"    Script ID: {script_id}")
-
-            print("    Uploading code...")
-            upload_project(
+        futures = [
+            executor.submit(
+                generate_one,
                 args.token,
-                script_id,
                 code,
+                i,
             )
+            for i in range(1, args.links + 1)
+        ]
 
-            print("    Creating version...")
-            version = create_version(
-                args.token,
-                script_id,
-            )
-
-            version_number = version["versionNumber"]
-
-            print(f"    Version: {version_number}")
-
-            print("    Deploying web app...")
-            deployment = create_deployment(
-                args.token,
-                script_id,
-                version_number,
-            )
-
-            url = get_webapp_url(deployment)
-
-            if not url:
-                raise RuntimeError(
-                    "Deployment succeeded, but Google did not return a WEB_APP URL."
-                )
-
-            results.append(
-                {
-                    "number": i,
-                    "title": title,
-                    "scriptId": script_id,
-                    "versionNumber": version_number,
-                    "deploymentId": deployment.get("deploymentId"),
-                    "url": url,
-                }
-            )
-
-            print(f"    /exec URL: {url}")
-            print()
-
-        except Exception as exc:
-            print(
-                f"    ERROR: {exc}",
-                file=sys.stderr,
-            )
-            print()
-
-        if i < args.links:
-            time.sleep(0.5)
-
-    print()
-    print("=" * 80)
-    print("WEB APP /exec LINKS")
-    print("=" * 80)
-
-    for result in results:
-        print(result["url"])
-
-    print("=" * 80)
-    print(
-        f"Created {len(results)} / {args.links} web apps successfully."
-    )
-
-    output_file = Path("generated_apps_script_links.json")
-
-    with output_file.open("w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-
-    print(f"Metadata saved to: {output_file}")
+        for future in as_completed(futures):
+            try:
+                url = future.result()
+                print(url, flush=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
